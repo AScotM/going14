@@ -9,7 +9,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
@@ -22,9 +21,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	"golang.org/x/sync/errgroup"
-	"golang.org/x/time/rate"
 )
 
 const (
@@ -343,27 +339,6 @@ func (pm *ProcessManager) getProcessName(pid string) string {
 	}
 
 	return ""
-}
-
-type RateLimitedResolver struct {
-	resolver *net.Resolver
-	limiter  *rate.Limiter
-	logger   *Logger
-}
-
-func NewRateLimitedResolver(requestsPerSecond int, logger *Logger) *RateLimitedResolver {
-	return &RateLimitedResolver{
-		resolver: &net.Resolver{},
-		limiter:  rate.NewLimiter(rate.Limit(requestsPerSecond), requestsPerSecond),
-		logger:   logger,
-	}
-}
-
-func (r *RateLimitedResolver) LookupAddr(ctx context.Context, ip string) ([]string, error) {
-	if err := r.limiter.Wait(ctx); err != nil {
-		return nil, err
-	}
-	return r.resolver.LookupAddr(ctx, ip)
 }
 
 type ConnectionTracker struct {
@@ -895,6 +870,42 @@ func calculateStats(sockets []Socket) ConnectionStats {
 	return stats
 }
 
+type DNSWorkerPool struct {
+	jobs    chan func()
+	wg      sync.WaitGroup
+	logger  *Logger
+}
+
+func NewDNSWorkerPool(maxWorkers int, logger *Logger) *DNSWorkerPool {
+	pool := &DNSWorkerPool{
+		jobs:   make(chan func(), maxWorkers*2),
+		logger: logger,
+	}
+
+	for i := 0; i < maxWorkers; i++ {
+		pool.wg.Add(1)
+		go pool.worker()
+	}
+
+	return pool
+}
+
+func (p *DNSWorkerPool) worker() {
+	defer p.wg.Done()
+	for job := range p.jobs {
+		job()
+	}
+}
+
+func (p *DNSWorkerPool) Submit(job func()) {
+	p.jobs <- job
+}
+
+func (p *DNSWorkerPool) Wait() {
+	close(p.jobs)
+	p.wg.Wait()
+}
+
 func resolveHosts(ctx context.Context, sockets []Socket, timeout time.Duration, maxConcurrent int, logger *Logger) error {
 	if maxConcurrent <= 0 {
 		maxConcurrent = DefaultMaxConcurrentDNS
@@ -903,29 +914,40 @@ func resolveHosts(ctx context.Context, sockets []Socket, timeout time.Duration, 
 		return nil
 	}
 
-	resolver := NewRateLimitedResolver(maxConcurrent, logger)
+	pool := NewDNSWorkerPool(maxConcurrent, logger)
+	defer pool.Wait()
+
+	resolver := &net.Resolver{}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	g, ctx := errgroup.WithContext(ctx)
-	g.SetLimit(maxConcurrent)
+	var mu sync.Mutex
+	var resolveErrors []error
 
 	for i := range sockets {
 		i := i
-		g.Go(func() error {
+		pool.Submit(func() {
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return
 			default:
-				return resolveSingleHost(ctx, resolver, &sockets[i])
+				if err := resolveSingleHost(ctx, resolver, &sockets[i]); err != nil {
+					mu.Lock()
+					resolveErrors = append(resolveErrors, err)
+					mu.Unlock()
+				}
 			}
 		})
 	}
 
-	return g.Wait()
+	if len(resolveErrors) > 0 {
+		return fmt.Errorf("DNS resolution had %d errors", len(resolveErrors))
+	}
+
+	return nil
 }
 
-func resolveSingleHost(ctx context.Context, resolver *RateLimitedResolver, socket *Socket) error {
+func resolveSingleHost(ctx context.Context, resolver *net.Resolver, socket *Socket) error {
 	ip := socket.RemoteIP
 	if ip == "0.0.0.0" || ip == "::" || ip == "*" {
 		return nil
@@ -936,16 +958,6 @@ func resolveSingleHost(ctx context.Context, resolver *RateLimitedResolver, socke
 		socket.Resolved = strings.TrimRight(names[0], ".")
 	}
 	return nil
-}
-
-func processInBatches(sockets []Socket, batchSize int, processor func([]Socket)) {
-	for i := 0; i < len(sockets); i += batchSize {
-		end := i + batchSize
-		if end > len(sockets) {
-			end = len(sockets)
-		}
-		processor(sockets[i:end])
-	}
 }
 
 func displayConnections(sockets []Socket, format string, noColor bool, watchMode bool, showStats bool) {
@@ -1253,7 +1265,6 @@ func runApplication(ctx context.Context, cfg *Config) error {
 	fileReader := &OSFileReader{}
 	procManager := NewProcessManager(fileReader, logger)
 	perfTracker := NewPerformanceTracker()
-	connectionTracker := NewConnectionTracker(30 * time.Minute)
 
 	if cfg.WatchInterval > 0 {
 		fmt.Printf("Monitoring TCP connections every %v. Press Ctrl+C to stop.\n", cfg.WatchInterval)
