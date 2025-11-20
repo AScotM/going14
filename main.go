@@ -27,8 +27,8 @@ const (
 	DefaultTCPFile          = "/proc/net/tcp"
 	DefaultTCP6File         = "/proc/net/tcp6"
 	DefaultWatchInterval    = 0
-	DefaultResolveTimeout   = 200 * time.Millisecond
-	DefaultMaxProcessAge    = 5 * time.Second
+	DefaultResolveTimeout   = 500 * time.Millisecond
+	DefaultMaxProcessAge    = 2 * time.Second
 	DefaultMaxConcurrentDNS = 10
 	MinFieldCount           = 10
 	MaxConcurrentDNSLimit   = 1000
@@ -41,6 +41,7 @@ var (
 	warnLog  = log.New(os.Stderr, "WARNING: ", log.LstdFlags)
 	errorLog = log.New(os.Stderr, "ERROR: ", log.LstdFlags)
 	debugLog = log.New(os.Stderr, "DEBUG: ", log.LstdFlags)
+	infoLog  = log.New(os.Stderr, "INFO: ", log.LstdFlags)
 )
 
 var tcpStates = map[int]string{
@@ -203,6 +204,10 @@ func (l *Logger) Debug(format string, args ...interface{}) {
 	}
 }
 
+func (l *Logger) Info(format string, args ...interface{}) {
+	infoLog.Printf(format, args...)
+}
+
 func (l *Logger) Warn(format string, args ...interface{}) {
 	warnLog.Printf(format, args...)
 }
@@ -216,6 +221,7 @@ type FileReader interface {
 	ReadDir(path string) ([]os.DirEntry, error)
 	Readlink(path string) (string, error)
 	Open(path string) (*os.File, error)
+	Stat(path string) (os.FileInfo, error)
 }
 
 type OSFileReader struct{}
@@ -234,6 +240,10 @@ func (o *OSFileReader) Readlink(path string) (string, error) {
 
 func (o *OSFileReader) Open(path string) (*os.File, error) {
 	return os.Open(path)
+}
+
+func (o *OSFileReader) Stat(path string) (os.FileInfo, error) {
+	return os.Stat(path)
 }
 
 type ProcessManager struct {
@@ -442,6 +452,31 @@ func (e *CSVExporter) Export(sockets []Socket, stats ConnectionStats) error {
 	return nil
 }
 
+type StreamingJSONExporter struct {
+	filePath string
+}
+
+func (e *StreamingJSONExporter) Export(sockets []Socket, stats ConnectionStats) error {
+	file, err := os.Create(e.filePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+
+	if err := encoder.Encode(map[string]interface{}{
+		"statistics":  stats,
+		"timestamp":   time.Now(),
+		"connections": sockets,
+	}); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 type PerformanceTracker struct {
 	mu           sync.RWMutex
 	measurements map[string]time.Duration
@@ -489,17 +524,24 @@ func isPid(name string) bool {
 }
 
 func safePath(path string) bool {
-	cleaned := filepath.Clean(path)
-	if !strings.HasPrefix(cleaned, "/proc/net/") {
+	abs, err := filepath.Abs(path)
+	if err != nil {
 		return false
 	}
-	if strings.Contains(cleaned, "..") {
-		return false
+	return strings.HasPrefix(abs, "/proc/net/") && !strings.Contains(abs, "..")
+}
+
+func validateIPRange(ipRange string) error {
+	if ipRange == "" {
+		return nil
 	}
-	if info, err := os.Stat(cleaned); err == nil {
-		return info.Mode().IsRegular()
+	if _, _, err := net.ParseCIDR(ipRange); err == nil {
+		return nil
 	}
-	return false
+	if net.ParseIP(ipRange) != nil {
+		return nil
+	}
+	return fmt.Errorf("invalid IP range: %s", ipRange)
 }
 
 func parseHexIPPort(s string, isIPv6 bool) (string, int, error) {
@@ -678,20 +720,12 @@ func validateFilters(state, localIP, remoteIP string) error {
 		}
 	}
 
-	if localIP != "" {
-		if _, _, err := net.ParseCIDR(localIP); err != nil {
-			if net.ParseIP(localIP) == nil {
-				return &FilterError{FilterType: "local_ip", Value: localIP, Err: errors.New("invalid local IP filter")}
-			}
-		}
+	if err := validateIPRange(localIP); err != nil {
+		return &FilterError{FilterType: "local_ip", Value: localIP, Err: err}
 	}
 
-	if remoteIP != "" {
-		if _, _, err := net.ParseCIDR(remoteIP); err != nil {
-			if net.ParseIP(remoteIP) == nil {
-				return &FilterError{FilterType: "remote_ip", Value: remoteIP, Err: errors.New("invalid remote IP filter")}
-			}
-		}
+	if err := validateIPRange(remoteIP); err != nil {
+		return &FilterError{FilterType: "remote_ip", Value: remoteIP, Err: err}
 	}
 
 	return nil
@@ -1130,20 +1164,55 @@ func clearScreen() {
 	fmt.Print("\033[H\033[2J")
 }
 
-func setupSignalHandler() context.Context {
+type SignalHandler struct {
+	ctx        context.Context
+	cancel     context.CancelFunc
+	signals    chan os.Signal
+	reloadChan chan bool
+}
+
+func NewSignalHandler() *SignalHandler {
 	ctx, cancel := context.WithCancel(context.Background())
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	handler := &SignalHandler{
+		ctx:        ctx,
+		cancel:     cancel,
+		signals:    make(chan os.Signal, 2),
+		reloadChan: make(chan bool, 1),
+	}
 
-	go func() {
-		sig := <-c
-		fmt.Printf("\nReceived signal %v, shutting down...\n", sig)
-		cancel()
-		time.Sleep(100 * time.Millisecond)
-		os.Exit(0)
-	}()
+	signal.Notify(handler.signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 
-	return ctx
+	go handler.handleSignals()
+	return handler
+}
+
+func (s *SignalHandler) handleSignals() {
+	for sig := range s.signals {
+		switch sig {
+		case os.Interrupt, syscall.SIGTERM:
+			fmt.Printf("\nReceived signal %v, shutting down...\n", sig)
+			s.cancel()
+			time.Sleep(100 * time.Millisecond)
+			os.Exit(0)
+		case syscall.SIGHUP:
+			fmt.Printf("\nReceived SIGHUP, reloading configuration...\n")
+			s.reloadChan <- true
+		}
+	}
+}
+
+func (s *SignalHandler) Context() context.Context {
+	return s.ctx
+}
+
+func (s *SignalHandler) ReloadChan() <-chan bool {
+	return s.reloadChan
+}
+
+func (s *SignalHandler) Close() {
+	signal.Stop(s.signals)
+	close(s.signals)
+	close(s.reloadChan)
 }
 
 func loadConfig(filename string) (*Config, error) {
@@ -1184,7 +1253,7 @@ func checkFileAccessibility(files ...string) error {
 func createExporter(exportFile, format string) (Exporter, error) {
 	switch format {
 	case "json":
-		return &JSONExporter{filePath: exportFile}, nil
+		return &StreamingJSONExporter{filePath: exportFile}, nil
 	case "csv":
 		return &CSVExporter{filePath: exportFile}, nil
 	default:
@@ -1265,9 +1334,14 @@ func runApplication(ctx context.Context, cfg *Config) error {
 	fileReader := &OSFileReader{}
 	procManager := NewProcessManager(fileReader, logger)
 	perfTracker := NewPerformanceTracker()
+	signalHandler := NewSignalHandler()
+	defer signalHandler.Close()
 
-	if cfg.WatchInterval > 0 {
-		fmt.Printf("Monitoring TCP connections every %v. Press Ctrl+C to stop.\n", cfg.WatchInterval)
+	var currentConfig = cfg
+	var configMutex sync.RWMutex
+
+	if currentConfig.WatchInterval > 0 {
+		fmt.Printf("Monitoring TCP connections every %v. Press Ctrl+C to stop.\n", currentConfig.WatchInterval)
 	}
 
 	var lastRun time.Time
@@ -1275,27 +1349,47 @@ func runApplication(ctx context.Context, cfg *Config) error {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-signalHandler.ReloadChan():
+			if currentConfig.ExportFile != "" {
+				newConfig, err := loadConfig(currentConfig.ExportFile)
+				if err != nil {
+					logger.Error("Failed to reload config: %v", err)
+					continue
+				}
+				configMutex.Lock()
+				currentConfig = newConfig
+				configMutex.Unlock()
+				logger.Info("Configuration reloaded")
+			}
 		default:
-			if cfg.WatchInterval > 0 && cfg.WatchInterval < MinWatchInterval {
+			configMutex.RLock()
+			watchInterval := currentConfig.WatchInterval
+			configMutex.RUnlock()
+
+			if watchInterval > 0 && watchInterval < MinWatchInterval {
 				if time.Since(lastRun) < MinWatchInterval {
 					time.Sleep(MinWatchInterval - time.Since(lastRun))
 				}
 			}
 
-			if cfg.WatchInterval > 0 {
+			if watchInterval > 0 {
 				clearScreen()
 			}
 
-			if err := processCycle(ctx, cfg, procManager, fileReader, perfTracker, logger); err != nil {
+			configMutex.RLock()
+			err := processCycle(ctx, currentConfig, procManager, fileReader, perfTracker, logger)
+			configMutex.RUnlock()
+
+			if err != nil {
 				return err
 			}
 
-			if cfg.WatchInterval <= 0 {
+			if watchInterval <= 0 {
 				return nil
 			}
 
 			lastRun = time.Now()
-			time.Sleep(cfg.WatchInterval)
+			time.Sleep(watchInterval)
 		}
 	}
 }
@@ -1375,7 +1469,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	ctx := setupSignalHandler()
+	signalHandler := NewSignalHandler()
+	ctx := signalHandler.Context()
 
 	if err := runApplication(ctx, config); err != nil {
 		fmt.Fprintf(os.Stderr, "Application error: %v\n", err)
