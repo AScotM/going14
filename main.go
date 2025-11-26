@@ -264,9 +264,14 @@ func NewProcessManager(fileReader FileReader, logger *Logger) *ProcessManager {
 
 func (pm *ProcessManager) Get(refreshInterval time.Duration) map[string]string {
 	pm.mu.RLock()
-	if pm.cache != nil && time.Since(pm.lastUpdate) <= refreshInterval {
+	cacheValid := pm.cache != nil && time.Since(pm.lastUpdate) <= refreshInterval
+	if cacheValid {
 		defer pm.mu.RUnlock()
-		return pm.cache
+		result := make(map[string]string, len(pm.cache))
+		for k, v := range pm.cache {
+			result[k] = v
+		}
+		return result
 	}
 	pm.mu.RUnlock()
 
@@ -274,12 +279,20 @@ func (pm *ProcessManager) Get(refreshInterval time.Duration) map[string]string {
 	defer pm.mu.Unlock()
 
 	if pm.cache != nil && time.Since(pm.lastUpdate) <= refreshInterval {
-		return pm.cache
+		result := make(map[string]string, len(pm.cache))
+		for k, v := range pm.cache {
+			result[k] = v
+		}
+		return result
 	}
 
 	pm.cache = pm.buildProcessMap()
 	pm.lastUpdate = time.Now()
-	return pm.cache
+	result := make(map[string]string, len(pm.cache))
+	for k, v := range pm.cache {
+		result[k] = v
+	}
+	return result
 }
 
 func (pm *ProcessManager) buildProcessMap() map[string]string {
@@ -352,26 +365,45 @@ func (pm *ProcessManager) getProcessName(pid string) string {
 }
 
 type ConnectionTracker struct {
-	mu         sync.RWMutex
-	history    map[string]time.Time
-	maxHistory time.Duration
+	mu          sync.RWMutex
+	history     map[string]time.Time
+	maxHistory  time.Duration
+	cleanupStop chan struct{}
 }
 
 func NewConnectionTracker(maxHistory time.Duration) *ConnectionTracker {
-	return &ConnectionTracker{
+	tracker := &ConnectionTracker{
 		history:    make(map[string]time.Time),
 		maxHistory: maxHistory,
 	}
+	tracker.startCleanup()
+	return tracker
+}
+
+func (ct *ConnectionTracker) startCleanup() {
+	ticker := time.NewTicker(ct.maxHistory / 2)
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				ct.cleanup()
+			case <-ct.cleanupStop:
+				ticker.Stop()
+				return
+			}
+		}
+	}()
 }
 
 func (ct *ConnectionTracker) Track(connKey string) {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
 	ct.history[connKey] = time.Now()
-	ct.cleanup()
 }
 
 func (ct *ConnectionTracker) cleanup() {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
 	now := time.Now()
 	for key, firstSeen := range ct.history {
 		if now.Sub(firstSeen) > ct.maxHistory {
@@ -387,6 +419,12 @@ func (ct *ConnectionTracker) GetDuration(connKey string) time.Duration {
 		return time.Since(firstSeen)
 	}
 	return 0
+}
+
+func (ct *ConnectionTracker) Close() {
+	if ct.cleanupStop != nil {
+		close(ct.cleanupStop)
+	}
 }
 
 type Exporter interface {
@@ -952,27 +990,27 @@ func resolveHosts(ctx context.Context, sockets []Socket, timeout time.Duration, 
 	defer pool.Wait()
 
 	resolver := &net.Resolver{}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 
 	var mu sync.Mutex
 	var resolveErrors []error
+	var wg sync.WaitGroup
 
 	for i := range sockets {
-		i := i
+		wg.Add(1)
 		pool.Submit(func() {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				if err := resolveSingleHost(ctx, resolver, &sockets[i]); err != nil {
-					mu.Lock()
-					resolveErrors = append(resolveErrors, err)
-					mu.Unlock()
-				}
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			
+			if err := resolveSingleHost(ctx, resolver, &sockets[i]); err != nil {
+				mu.Lock()
+				resolveErrors = append(resolveErrors, err)
+				mu.Unlock()
 			}
 		})
 	}
+
+	wg.Wait()
 
 	if len(resolveErrors) > 0 {
 		return fmt.Errorf("DNS resolution had %d errors", len(resolveErrors))
