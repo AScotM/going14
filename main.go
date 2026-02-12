@@ -35,6 +35,7 @@ const (
 	MaxResolveTimeout       = 30 * time.Second
 	MinWatchInterval        = 100 * time.Millisecond
 	DefaultBatchSize        = 1000
+	MaxCacheSize            = 10000
 )
 
 var (
@@ -188,6 +189,7 @@ type Config struct {
 	BatchSize        int           `json:"batch_size"`
 	ExportFile       string        `json:"export_file"`
 	ExportFormat     string        `json:"export_format"`
+	ConfigFile       string        `json:"-"`
 }
 
 type Logger struct {
@@ -246,12 +248,101 @@ func (o *OSFileReader) Stat(path string) (os.FileInfo, error) {
 	return os.Stat(path)
 }
 
+type DNSCache struct {
+	mu       sync.RWMutex
+	entries  map[string]dnsCacheEntry
+	ttl      time.Duration
+	maxSize  int
+}
+
+type dnsCacheEntry struct {
+	hostname  string
+	expiresAt time.Time
+}
+
+func NewDNSCache(ttl time.Duration, maxSize int) *DNSCache {
+	cache := &DNSCache{
+		entries: make(map[string]dnsCacheEntry),
+		ttl:     ttl,
+		maxSize: maxSize,
+	}
+	go cache.cleanup()
+	return cache
+}
+
+func (c *DNSCache) Get(ip string) (string, bool) {
+	c.mu.RLock()
+	entry, exists := c.entries[ip]
+	c.mu.RUnlock()
+	
+	if !exists {
+		return "", false
+	}
+	
+	if time.Now().After(entry.expiresAt) {
+		c.mu.Lock()
+		delete(c.entries, ip)
+		c.mu.Unlock()
+		return "", false
+	}
+	
+	return entry.hostname, true
+}
+
+func (c *DNSCache) Set(ip, hostname string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	
+	if len(c.entries) >= c.maxSize {
+		c.evictOldest()
+	}
+	
+	c.entries[ip] = dnsCacheEntry{
+		hostname:  hostname,
+		expiresAt: time.Now().Add(c.ttl),
+	}
+}
+
+func (c *DNSCache) evictOldest() {
+	var oldestKey string
+	var oldestTime time.Time
+	
+	for k, v := range c.entries {
+		if oldestKey == "" || v.expiresAt.Before(oldestTime) {
+			oldestKey = k
+			oldestTime = v.expiresAt
+		}
+	}
+	
+	if oldestKey != "" {
+		delete(c.entries, oldestKey)
+	}
+}
+
+func (c *DNSCache) cleanup() {
+	ticker := time.NewTicker(c.ttl)
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		c.mu.Lock()
+		now := time.Now()
+		for k, v := range c.entries {
+			if now.After(v.expiresAt) {
+				delete(c.entries, k)
+			}
+		}
+		c.mu.Unlock()
+	}
+}
+
 type ProcessManager struct {
 	mu         sync.RWMutex
 	cache      map[string]string
 	lastUpdate time.Time
 	fileReader FileReader
 	logger     *Logger
+	hitCount   int64
+	missCount  int64
 }
 
 func NewProcessManager(fileReader FileReader, logger *Logger) *ProcessManager {
@@ -266,11 +357,12 @@ func (pm *ProcessManager) Get(refreshInterval time.Duration) map[string]string {
 	pm.mu.RLock()
 	cacheValid := pm.cache != nil && time.Since(pm.lastUpdate) <= refreshInterval
 	if cacheValid {
-		defer pm.mu.RUnlock()
 		result := make(map[string]string, len(pm.cache))
 		for k, v := range pm.cache {
 			result[k] = v
 		}
+		pm.hitCount++
+		pm.mu.RUnlock()
 		return result
 	}
 	pm.mu.RUnlock()
@@ -283,16 +375,39 @@ func (pm *ProcessManager) Get(refreshInterval time.Duration) map[string]string {
 		for k, v := range pm.cache {
 			result[k] = v
 		}
+		pm.hitCount++
 		return result
 	}
 
 	pm.cache = pm.buildProcessMap()
 	pm.lastUpdate = time.Now()
+	
+	if len(pm.cache) > MaxCacheSize {
+		newCache := make(map[string]string)
+		count := 0
+		for k, v := range pm.cache {
+			newCache[k] = v
+			count++
+			if count >= MaxCacheSize {
+				break
+			}
+		}
+		pm.cache = newCache
+	}
+	
+	pm.missCount++
+	
 	result := make(map[string]string, len(pm.cache))
 	for k, v := range pm.cache {
 		result[k] = v
 	}
 	return result
+}
+
+func (pm *ProcessManager) GetStats() (hits, misses int64) {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	return pm.hitCount, pm.missCount
 }
 
 func (pm *ProcessManager) buildProcessMap() map[string]string {
@@ -373,26 +488,26 @@ type ConnectionTracker struct {
 
 func NewConnectionTracker(maxHistory time.Duration) *ConnectionTracker {
 	tracker := &ConnectionTracker{
-		history:    make(map[string]time.Time),
-		maxHistory: maxHistory,
+		history:     make(map[string]time.Time),
+		maxHistory:  maxHistory,
+		cleanupStop: make(chan struct{}),
 	}
-	tracker.startCleanup()
+	go tracker.startCleanup()
 	return tracker
 }
 
 func (ct *ConnectionTracker) startCleanup() {
 	ticker := time.NewTicker(ct.maxHistory / 2)
-	go func() {
-		for {
-			select {
-			case <-ticker.C:
-				ct.cleanup()
-			case <-ct.cleanupStop:
-				ticker.Stop()
-				return
-			}
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ticker.C:
+			ct.cleanup()
+		case <-ct.cleanupStop:
+			return
 		}
-	}()
+	}
 }
 
 func (ct *ConnectionTracker) Track(connKey string) {
@@ -553,20 +668,33 @@ var socketPool = sync.Pool{
 }
 
 func isPid(name string) bool {
+	if name == "" {
+		return false
+	}
 	for _, char := range name {
 		if char < '0' || char > '9' {
 			return false
 		}
 	}
-	return name != ""
+	return true
 }
 
 func safePath(path string) bool {
-	abs, err := filepath.Abs(path)
-	if err != nil {
+	if path == "" {
 		return false
 	}
-	return strings.HasPrefix(abs, "/proc/net/") && !strings.Contains(abs, "..")
+	
+	cleanPath := filepath.Clean(path)
+	
+	if !strings.HasPrefix(cleanPath, "/proc/net/") {
+		return false
+	}
+	
+	if strings.Contains(cleanPath, "..") {
+		return false
+	}
+	
+	return true
 }
 
 func validateIPRange(ipRange string) error {
@@ -588,41 +716,44 @@ func parseHexIPPort(s string, isIPv6 bool) (string, int, error) {
 		return "", 0, &ParseError{Field: "ip:port", Value: s, Err: errors.New("invalid format")}
 	}
 
-	if isIPv6 && len(parts) > 2 {
-		ipHex := strings.Join(parts[:len(parts)-1], "")
-		portHex := parts[len(parts)-1]
-		parts = []string{ipHex, portHex}
-	}
-
-	ipHex, portHex := parts[0], parts[1]
-
-	ipBytes, err := hex.DecodeString(ipHex)
-	if err != nil {
-		return "", 0, &ParseError{Field: "IP", Value: ipHex, Err: err}
-	}
-
-	for i, j := 0, len(ipBytes)-1; i < j; i, j = i+1, j-1 {
-		ipBytes[i], ipBytes[j] = ipBytes[j], ipBytes[i]
-	}
-
-	expectedLen := 4
+	var ipHex, portHex string
+	
 	if isIPv6 {
-		expectedLen = 16
-	}
-	if len(ipBytes) != expectedLen {
-		return "", 0, &ParseError{
-			Field: "IP",
-			Value: ipHex,
-			Err:   fmt.Errorf("invalid IP length: got %d expected %d", len(ipBytes), expectedLen),
-		}
+		portHex = parts[len(parts)-1]
+		ipHex = strings.Join(parts[:len(parts)-1], ":")
+	} else {
+		ipHex, portHex = parts[0], parts[1]
 	}
 
-	ip := net.IP(ipBytes).String()
+	if !isIPv6 {
+		ipBytes, err := hex.DecodeString(ipHex)
+		if err != nil {
+			return "", 0, &ParseError{Field: "IP", Value: ipHex, Err: err}
+		}
+		
+		for i, j := 0, len(ipBytes)-1; i < j; i, j = i+1, j-1 {
+			ipBytes[i], ipBytes[j] = ipBytes[j], ipBytes[i]
+		}
+		
+		ip := net.IP(ipBytes).String()
+		port, err := strconv.ParseInt(portHex, 16, 32)
+		if err != nil {
+			return "", 0, &ParseError{Field: "port", Value: portHex, Err: err}
+		}
+		return ip, int(port), nil
+	}
+
+	ip := net.ParseIP(ipHex)
+	if ip == nil {
+		return "", 0, &ParseError{Field: "IP", Value: ipHex, Err: errors.New("invalid IPv6 address")}
+	}
+	
 	port, err := strconv.ParseInt(portHex, 16, 32)
 	if err != nil {
 		return "", 0, &ParseError{Field: "port", Value: portHex, Err: err}
 	}
-	return ip, int(port), nil
+	
+	return ip.String(), int(port), nil
 }
 
 func readTCPConnectionsWithReader(reader FileReader, filePath string, verbose bool, isIPv6 bool, procMap map[string]string, logger *Logger) ([]Socket, error) {
@@ -640,7 +771,12 @@ func readTCPConnectionsWithReader(reader FileReader, filePath string, verbose bo
 	defer file.Close()
 
 	sockets := socketPool.Get().([]Socket)
+	sockets = sockets[:0]
+	
 	defer func() {
+		for i := range sockets {
+			sockets[i] = Socket{}
+		}
 		sockets = sockets[:0]
 		socketPool.Put(sockets)
 	}()
@@ -946,12 +1082,18 @@ type DNSWorkerPool struct {
 	jobs    chan func()
 	wg      sync.WaitGroup
 	logger  *Logger
+	ctx     context.Context
+	cancel  context.CancelFunc
 }
 
 func NewDNSWorkerPool(maxWorkers int, logger *Logger) *DNSWorkerPool {
+	ctx, cancel := context.WithCancel(context.Background())
+	
 	pool := &DNSWorkerPool{
 		jobs:   make(chan func(), maxWorkers*2),
 		logger: logger,
+		ctx:    ctx,
+		cancel: cancel,
 	}
 
 	for i := 0; i < maxWorkers; i++ {
@@ -964,21 +1106,35 @@ func NewDNSWorkerPool(maxWorkers int, logger *Logger) *DNSWorkerPool {
 
 func (p *DNSWorkerPool) worker() {
 	defer p.wg.Done()
-	for job := range p.jobs {
-		job()
+	for {
+		select {
+		case job, ok := <-p.jobs:
+			if !ok {
+				return
+			}
+			job()
+		case <-p.ctx.Done():
+			return
+		}
 	}
 }
 
-func (p *DNSWorkerPool) Submit(job func()) {
-	p.jobs <- job
+func (p *DNSWorkerPool) Submit(job func()) error {
+	select {
+	case p.jobs <- job:
+		return nil
+	case <-p.ctx.Done():
+		return p.ctx.Err()
+	}
 }
 
 func (p *DNSWorkerPool) Wait() {
+	p.cancel()
 	close(p.jobs)
 	p.wg.Wait()
 }
 
-func resolveHosts(ctx context.Context, sockets []Socket, timeout time.Duration, maxConcurrent int, logger *Logger) error {
+func resolveHosts(ctx context.Context, sockets []Socket, timeout time.Duration, maxConcurrent int, dnsCache *DNSCache, logger *Logger) error {
 	if maxConcurrent <= 0 {
 		maxConcurrent = DefaultMaxConcurrentDNS
 	}
@@ -997,17 +1153,37 @@ func resolveHosts(ctx context.Context, sockets []Socket, timeout time.Duration, 
 
 	for i := range sockets {
 		wg.Add(1)
-		pool.Submit(func() {
+		
+		if err := pool.Submit(func() {
 			defer wg.Done()
-			ctx, cancel := context.WithTimeout(ctx, timeout)
+			
+			ip := sockets[i].RemoteIP
+			if ip == "0.0.0.0" || ip == "::" || ip == "*" {
+				return
+			}
+			
+			if cached, found := dnsCache.Get(ip); found {
+				sockets[i].Resolved = cached
+				return
+			}
+			
+			resolveCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 			
-			if err := resolveSingleHost(ctx, resolver, &sockets[i]); err != nil {
+			names, err := resolver.LookupAddr(resolveCtx, ip)
+			if err == nil && len(names) > 0 {
+				hostname := strings.TrimRight(names[0], ".")
+				sockets[i].Resolved = hostname
+				dnsCache.Set(ip, hostname)
+			} else {
 				mu.Lock()
-				resolveErrors = append(resolveErrors, err)
+				resolveErrors = append(resolveErrors, &DNSError{IP: ip, Err: err})
 				mu.Unlock()
 			}
-		})
+		}); err != nil {
+			wg.Done()
+			logger.Warn("Failed to submit DNS job: %v", err)
+		}
 	}
 
 	wg.Wait()
@@ -1019,15 +1195,121 @@ func resolveHosts(ctx context.Context, sockets []Socket, timeout time.Duration, 
 	return nil
 }
 
-func resolveSingleHost(ctx context.Context, resolver *net.Resolver, socket *Socket) error {
-	ip := socket.RemoteIP
-	if ip == "0.0.0.0" || ip == "::" || ip == "*" {
-		return nil
+type columnWidths struct {
+	state  int
+	local  int
+	remote int
+	proc   int
+}
+
+func calculateColumnWidths(sockets []Socket) columnWidths {
+	widths := columnWidths{
+		state:  len("State"),
+		local:  len("Local Address"),
+		remote: len("Remote Address"),
+		proc:   len("Process"),
 	}
 
-	names, err := resolver.LookupAddr(ctx, ip)
-	if err == nil && len(names) > 0 {
-		socket.Resolved = strings.TrimRight(names[0], ".")
+	for _, s := range sockets {
+		if len(s.State) > widths.state {
+			widths.state = len(s.State)
+		}
+		
+		l := fmt.Sprintf("%s:%d", s.LocalIP, s.LocalPort)
+		if len(l) > widths.local {
+			widths.local = len(l)
+		}
+		
+		r := fmt.Sprintf("%s:%d", s.RemoteIP, s.RemotePort)
+		if len(r) > widths.remote {
+			widths.remote = len(r)
+		}
+		
+		proc := s.Process
+		if s.Resolved != "" {
+			proc = fmt.Sprintf("%s [%s]", proc, s.Resolved)
+		}
+		if len(proc) > widths.proc {
+			widths.proc = len(proc)
+		}
+	}
+
+	return widths
+}
+
+func displayTableHeader(widths columnWidths) {
+	fmt.Printf("\nACTIVE TCP CONNECTIONS:\n")
+	fmt.Printf("%-*s %-*s %-*s %-*s\n", 
+		widths.state, "State", 
+		widths.local, "Local Address", 
+		widths.remote, "Remote Address", 
+		widths.proc, "Process")
+	fmt.Println(strings.Repeat("-", widths.state+widths.local+widths.remote+widths.proc+3))
+}
+
+func formatTableRow(s Socket, widths columnWidths, noColor bool) {
+	state := s.State
+	if !noColor {
+		if cf, ok := stateColors[s.State]; ok {
+			state = fmt.Sprintf(cf, s.State)
+		}
+	}
+	
+	localAddr := fmt.Sprintf("%s:%d", s.LocalIP, s.LocalPort)
+	remoteAddr := fmt.Sprintf("%s:%d", s.RemoteIP, s.RemotePort)
+	process := s.Process
+	
+	if s.Resolved != "" {
+		process = fmt.Sprintf("%s [%s]", process, s.Resolved)
+	}
+	
+	fmt.Printf("%-*s %-*s %-*s %-*s\n", 
+		widths.state, state, 
+		widths.local, localAddr, 
+		widths.remote, remoteAddr, 
+		widths.proc, process)
+}
+
+func displayJSON(sockets []Socket, showStats bool) error {
+	var output interface{}
+	if showStats {
+		stats := calculateStats(sockets)
+		output = map[string]interface{}{
+			"connections": sockets,
+			"statistics":  stats,
+		}
+	} else {
+		output = sockets
+	}
+	data, err := json.MarshalIndent(output, "", "  ")
+	if err != nil {
+		return fmt.Errorf("error marshaling JSON: %w", err)
+	}
+	fmt.Println(string(data))
+	return nil
+}
+
+func displayCSV(sockets []Socket) error {
+	writer := csv.NewWriter(os.Stdout)
+	defer writer.Flush()
+
+	headers := []string{"State", "LocalIP", "LocalPort", "RemoteIP", "RemotePort", "Process"}
+	if err := writer.Write(headers); err != nil {
+		return fmt.Errorf("error writing CSV header: %w", err)
+	}
+
+	for _, s := range sockets {
+		record := []string{
+			s.State,
+			s.LocalIP,
+			strconv.Itoa(s.LocalPort),
+			s.RemoteIP,
+			strconv.Itoa(s.RemotePort),
+			s.Process,
+		}
+		if err := writer.Write(record); err != nil {
+			return fmt.Errorf("error writing CSV record: %w", err)
+		}
 	}
 	return nil
 }
@@ -1038,106 +1320,33 @@ func displayConnections(sockets []Socket, format string, noColor bool, watchMode
 		return
 	}
 
-	if watchMode && format == "table" {
+	if watchMode && format == "table" && showStats {
 		stats := calculateStats(sockets)
-		fmt.Printf("%s - %d connections", time.Now().Format("2006-01-02 15:04:05"), stats.Total)
-		if showStats {
-			fmt.Printf(" [EST:%d LISTEN:%d TIME_WAIT:%d]",
-				stats.ByState["ESTABLISHED"],
-				stats.ByState["LISTEN"],
-				stats.ByState["TIME_WAIT"])
-		}
-		fmt.Println()
-		return
+		fmt.Printf("%s - %d connections [EST:%d LISTEN:%d TIME_WAIT:%d]\n",
+			time.Now().Format("2006-01-02 15:04:05"),
+			stats.Total,
+			stats.ByState["ESTABLISHED"],
+			stats.ByState["LISTEN"],
+			stats.ByState["TIME_WAIT"])
 	}
 
-	if format == "json" {
-		var output interface{}
-		if showStats {
-			stats := calculateStats(sockets)
-			output = map[string]interface{}{
-				"connections": sockets,
-				"statistics":  stats,
-			}
-		} else {
-			output = sockets
+	switch format {
+	case "json":
+		if err := displayJSON(sockets, showStats); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
 		}
-		data, err := json.MarshalIndent(output, "", "  ")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error marshaling JSON: %v\n", err)
-			return
+	case "csv":
+		if err := displayCSV(sockets); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
 		}
-		fmt.Println(string(data))
-		return
-	}
-
-	if format == "csv" {
-		writer := csv.NewWriter(os.Stdout)
-		defer writer.Flush()
-
-		headers := []string{"State", "LocalIP", "LocalPort", "RemoteIP", "RemotePort", "Process"}
-		if err := writer.Write(headers); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing CSV: %v\n", err)
-			return
+	default:
+		widths := calculateColumnWidths(sockets)
+		if !watchMode {
+			displayTableHeader(widths)
 		}
-
 		for _, s := range sockets {
-			record := []string{
-				s.State,
-				s.LocalIP,
-				strconv.Itoa(s.LocalPort),
-				s.RemoteIP,
-				strconv.Itoa(s.RemotePort),
-				s.Process,
-			}
-			if err := writer.Write(record); err != nil {
-				fmt.Fprintf(os.Stderr, "Error writing CSV: %v\n", err)
-				return
-			}
+			formatTableRow(s, widths, noColor)
 		}
-		return
-	}
-
-	maxState := len("State")
-	maxLocal := len("Local Address")
-	maxRemote := len("Remote Address")
-	maxProc := len("Process")
-
-	for _, s := range sockets {
-		if len(s.State) > maxState {
-			maxState = len(s.State)
-		}
-		l := fmt.Sprintf("%s:%d", s.LocalIP, s.LocalPort)
-		r := fmt.Sprintf("%s:%d", s.RemoteIP, s.RemotePort)
-		if len(l) > maxLocal {
-			maxLocal = len(l)
-		}
-		if len(r) > maxRemote {
-			maxRemote = len(r)
-		}
-		if len(s.Process) > maxProc {
-			maxProc = len(s.Process)
-		}
-	}
-
-	fmt.Printf("\nACTIVE TCP CONNECTIONS:\n")
-	fmt.Printf("%-*s %-*s %-*s %-*s\n", maxState, "State", maxLocal, "Local Address", maxRemote, "Remote Address", maxProc, "Process")
-	fmt.Println(strings.Repeat("-", maxState+maxLocal+maxRemote+maxProc+3))
-
-	for _, s := range sockets {
-		state := s.State
-		if !noColor {
-			if cf, ok := stateColors[s.State]; ok {
-				state = fmt.Sprintf(cf, s.State)
-			}
-		}
-		localAddr := fmt.Sprintf("%s:%d", s.LocalIP, s.LocalPort)
-		remoteAddr := fmt.Sprintf("%s:%d", s.RemoteIP, s.RemotePort)
-		process := s.Process
-		if s.Resolved != "" {
-			process = fmt.Sprintf("%s [%s]", process, s.Resolved)
-		}
-		fmt.Printf("%-*s %-*s %-*s %-*s\n", maxState, state, maxLocal, localAddr, maxRemote, remoteAddr, maxProc, process)
 	}
 }
 
@@ -1206,7 +1415,8 @@ type SignalHandler struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	signals    chan os.Signal
-	reloadChan chan bool
+	reloadChan chan string
+	done       chan struct{}
 }
 
 func NewSignalHandler() *SignalHandler {
@@ -1215,7 +1425,8 @@ func NewSignalHandler() *SignalHandler {
 		ctx:        ctx,
 		cancel:     cancel,
 		signals:    make(chan os.Signal, 2),
-		reloadChan: make(chan bool, 1),
+		reloadChan: make(chan string, 1),
+		done:       make(chan struct{}),
 	}
 
 	signal.Notify(handler.signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
@@ -1225,16 +1436,29 @@ func NewSignalHandler() *SignalHandler {
 }
 
 func (s *SignalHandler) handleSignals() {
-	for sig := range s.signals {
-		switch sig {
-		case os.Interrupt, syscall.SIGTERM:
-			fmt.Printf("\nReceived signal %v, shutting down...\n", sig)
-			s.cancel()
-			time.Sleep(100 * time.Millisecond)
-			os.Exit(0)
-		case syscall.SIGHUP:
-			fmt.Printf("\nReceived SIGHUP, reloading configuration...\n")
-			s.reloadChan <- true
+	defer close(s.done)
+	
+	for {
+		select {
+		case sig, ok := <-s.signals:
+			if !ok {
+				return
+			}
+			
+			switch sig {
+			case os.Interrupt, syscall.SIGTERM:
+				fmt.Printf("\nReceived signal %v, shutting down...\n", sig)
+				s.cancel()
+				return
+			case syscall.SIGHUP:
+				fmt.Printf("\nReceived SIGHUP, reloading configuration...\n")
+				select {
+				case s.reloadChan <- "reload":
+				default:
+				}
+			}
+		case <-s.ctx.Done():
+			return
 		}
 	}
 }
@@ -1243,13 +1467,15 @@ func (s *SignalHandler) Context() context.Context {
 	return s.ctx
 }
 
-func (s *SignalHandler) ReloadChan() <-chan bool {
+func (s *SignalHandler) ReloadChan() <-chan string {
 	return s.reloadChan
 }
 
 func (s *SignalHandler) Close() {
 	signal.Stop(s.signals)
 	close(s.signals)
+	s.cancel()
+	<-s.done
 	close(s.reloadChan)
 }
 
@@ -1268,6 +1494,7 @@ func loadConfig(filename string) (*Config, error) {
 		return nil, &ConnectionError{Op: "parse config", Path: filename, Err: err}
 	}
 
+	config.ConfigFile = filename
 	config.ApplyDefaults()
 	return &config, nil
 }
@@ -1277,12 +1504,8 @@ func checkFileAccessibility(files ...string) error {
 		if !safePath(f) {
 			return &ConnectionError{Op: "access", Path: f, Err: errors.New("invalid path")}
 		}
-		if _, err := os.Stat(f); err == nil {
-			if file, err := os.Open(f); err != nil {
-				return &ConnectionError{Op: "access", Path: f, Err: fmt.Errorf("need root privileges: %w", err)}
-			} else {
-				file.Close()
-			}
+		if _, err := os.Stat(f); os.IsNotExist(err) {
+			continue
 		}
 	}
 	return nil
@@ -1299,7 +1522,7 @@ func createExporter(exportFile, format string) (Exporter, error) {
 	}
 }
 
-func processCycle(ctx context.Context, cfg *Config, procManager *ProcessManager, fileReader FileReader, perfTracker *PerformanceTracker, logger *Logger) error {
+func processCycle(ctx context.Context, cfg *Config, procManager *ProcessManager, dnsCache *DNSCache, fileReader FileReader, perfTracker *PerformanceTracker, logger *Logger) error {
 	var sockets []Socket
 	var errors []string
 
@@ -1328,7 +1551,7 @@ func processCycle(ctx context.Context, cfg *Config, procManager *ProcessManager,
 
 	if cfg.Resolve {
 		perfTracker.Measure("dns_resolve", func() {
-			if err := resolveHosts(ctx, sockets, cfg.ResolveTimeout, cfg.MaxConcurrentDNS, logger); err != nil {
+			if err := resolveHosts(ctx, sockets, cfg.ResolveTimeout, cfg.MaxConcurrentDNS, dnsCache, logger); err != nil {
 				logger.Warn("DNS resolution incomplete: %v", err)
 			}
 		})
@@ -1358,9 +1581,16 @@ func processCycle(ctx context.Context, cfg *Config, procManager *ProcessManager,
 
 	if cfg.Verbose {
 		measurements := perfTracker.GetMeasurements()
+		hits, misses := procManager.GetStats()
+		
 		fmt.Println("\nPerformance Metrics:")
 		for op, duration := range measurements {
 			fmt.Printf("  %s: %v\n", op, duration)
+		}
+		
+		if hits+misses > 0 {
+			hitRate := float64(hits) / float64(hits+misses) * 100
+			fmt.Printf("  process_cache: hits=%d misses=%d hit_rate=%.1f%%\n", hits, misses, hitRate)
 		}
 	}
 
@@ -1371,6 +1601,7 @@ func runApplication(ctx context.Context, cfg *Config) error {
 	logger := NewLogger(cfg.Verbose)
 	fileReader := &OSFileReader{}
 	procManager := NewProcessManager(fileReader, logger)
+	dnsCache := NewDNSCache(5*time.Minute, 1000)
 	perfTracker := NewPerformanceTracker()
 	signalHandler := NewSignalHandler()
 	defer signalHandler.Close()
@@ -1388,8 +1619,8 @@ func runApplication(ctx context.Context, cfg *Config) error {
 		case <-ctx.Done():
 			return nil
 		case <-signalHandler.ReloadChan():
-			if currentConfig.ExportFile != "" {
-				newConfig, err := loadConfig(currentConfig.ExportFile)
+			if currentConfig.ConfigFile != "" {
+				newConfig, err := loadConfig(currentConfig.ConfigFile)
 				if err != nil {
 					logger.Error("Failed to reload config: %v", err)
 					continue
@@ -1415,7 +1646,7 @@ func runApplication(ctx context.Context, cfg *Config) error {
 			}
 
 			configMutex.RLock()
-			err := processCycle(ctx, currentConfig, procManager, fileReader, perfTracker, logger)
+			err := processCycle(ctx, currentConfig, procManager, dnsCache, fileReader, perfTracker, logger)
 			configMutex.RUnlock()
 
 			if err != nil {
